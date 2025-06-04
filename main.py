@@ -31,7 +31,11 @@ def main():
     skipped_song_count = 0
     report_lines = []
 
-    for song in selected_playlist.Songs:
+    all_songs = selected_playlist.Songs
+    # Sort all_songs by song.TrackNo ascending
+    all_songs.sort(key=lambda song: song.TrackNo)
+
+    for song in all_songs:
         content = song.Content
         # Get hot cues (non-memory cues)
         hot_cues: List[DjmdCue] = [cue for cue in content.Cues if not cue.is_memory_cue]
@@ -57,7 +61,7 @@ def main():
 
         duration_str = format_duration(max_distance_ms)
 
-        report_lines.append(f"'{content.Title}': {max_distance_ms} ms ({duration_str})")
+        report_lines.append(f"#{song.TrackNo} - '{content.Title}': {max_distance_ms} ms ({duration_str})")
 
     total_duration_str = format_duration(total_duration_ms)
 
