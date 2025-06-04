@@ -54,9 +54,15 @@ def main():
             distance = hot_cues[i + 1].InMsec - hot_cues[i].InMsec
             distances_ms.append(distance)
 
-        # Find the max distance
-        max_distance_ms = max(distances_ms)
+        # Sort the distances, then add the greatest distance and the 2nd greatest distance to the total duration
+        # 2nd greatest distance is for the transition.
+        distances_ms.sort(reverse=True)
+        if len(distances_ms) < 2:
+            report_lines.append(f"Skipping '{content.Title}': not enough distances calculated.")
+            skipped_song_count += 1
+            continue
 
+        max_distance_ms = distances_ms[0] + distances_ms[1]
         total_duration_ms += max_distance_ms
 
         duration_str = format_duration(max_distance_ms)
