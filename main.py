@@ -9,6 +9,13 @@ def format_duration(ms: int) -> str:
     seconds = (ms % 60000) // 1000
     return f"{minutes}m {seconds}s"
 
+
+def rekordbox_bpm_to_bpm(rekordbox_bpm: int):
+    if not rekordbox_bpm:
+        return 0
+    bpm = rekordbox_bpm / 100
+    return bpm
+
 def main():
     # Parse playlist name from command-line argument
     parser = argparse.ArgumentParser(description="Get songs and cue timings from a Rekordbox playlist.")
@@ -67,7 +74,7 @@ def main():
 
         duration_str = format_duration(max_distance_ms)
 
-        report_lines.append(f"#{song.TrackNo} - '{content.Title}': {max_distance_ms} ms ({duration_str}). Play Count: {song.Content.DJPlayCount}")
+        report_lines.append(f"#{song.TrackNo} - '{content.Title}': {max_distance_ms} ms ({duration_str}). Play Count: {song.Content.DJPlayCount}, BPM: {rekordbox_bpm_to_bpm(song.Content.BPM)}, Key: {song.Content.Key.ScaleName}")
 
     total_duration_str = format_duration(total_duration_ms)
 
