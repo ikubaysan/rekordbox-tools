@@ -1,86 +1,88 @@
-# rekordbox_analyzer.py
+# RekordboxPlaylistAnalyzer.py
+"""
+RekordboxPlaylistAnalyzer
+--------------------------
+
+Encapsulates all of your Rekordbox DB logic:
+  • Fetching & sorting playlist songs by track number
+  • Seeding + detecting changes in DJPlayCount
+  • Converting Rekordbox’s integer BPM → float BPM
+  • Computing a “base” BPM (first track or average)
+  • Computing a BPM multiplier
+
+This is meant to be imported; you do not run this directly.
+"""
 
 from pyrekordbox import Rekordbox6Database
-from pyrekordbox.db6.tables import DjmdPlaylist, DjmdCue
-from typing import List, Dict, Optional
-
+from pyrekordbox.db6.tables import DjmdPlaylist
+from typing import Dict, Tuple
 
 class RekordboxPlaylistAnalyzer:
     def __init__(self):
         self.db = Rekordbox6Database()
         self.playlists: Dict[str, DjmdPlaylist] = {
-            playlist.Name: playlist for playlist in self.db.get_playlist()
+            pl.Name: pl for pl in self.db.get_playlist()
         }
-
-    def format_duration(self, ms: int) -> str:
-        minutes = ms // 60000
-        seconds = (ms % 60000) // 1000
-        return f"{minutes}m {seconds}s"
 
     @staticmethod
     def rekordbox_bpm_to_bpm(rekordbox_bpm: int) -> float:
-        return rekordbox_bpm / 100 if rekordbox_bpm else 0.0
+        """Convert Rekordbox’s integer BPM (e.g. 12900) to a float (129.00)."""
+        return rekordbox_bpm / 100.0 if rekordbox_bpm else 0.0
 
-    def get_playlist(self, name: str) -> Optional[DjmdPlaylist]:
-        return self.playlists.get(name)
-
-    def analyze_playlist(self, playlist_name: str) -> str:
-        playlist = self.get_playlist(playlist_name)
+    def get_playlist_songs_by_trackno(self, name: str):
+        """
+        Return songs sorted by TrackNo;
+        raises ValueError if the named playlist doesn’t exist.
+        """
+        playlist = self.playlists.get(name)
         if playlist is None:
-            return f"Playlist '{playlist_name}' not found."
+            raise ValueError(f"Playlist '{name}' not found.")
+        return sorted(playlist.Songs, key=lambda s: s.TrackNo)
 
-        output = [f"Playlist '{playlist_name}' found with {len(playlist.Songs)} songs.\n"]
+    def init_play_counts(self, playlist: str) -> Dict[int, int]:
+        """
+        Build initial map: Content.ID → DJPlayCount
+        for seeding a monitoring loop.
+        """
+        songs = self.get_playlist_songs_by_trackno(playlist)
+        return {song.Content.ID: song.Content.DJPlayCount for song in songs}
 
-        total_duration_ms = 0
-        skipped_count = 0
-        song_lines = []
+    def detect_current_song(
+        self,
+        playlist: str,
+        previous_counts: Dict[int, int]
+    ) -> Tuple[object, Dict[int, int]]:
+        """
+        Compare current DJPlayCount vs. previous_counts,
+        return (current_song, new_counts_map).
+        If none incremented, returns the first track.
+        """
+        songs = self.get_playlist_songs_by_trackno(playlist)
+        new_counts = {}
+        current = None
 
-        all_songs = sorted(playlist.Songs, key=lambda song: song.TrackNo)
+        for song in songs:
+            cid = song.Content.ID
+            curr = song.Content.DJPlayCount
+            prev = previous_counts.get(cid, curr)
+            new_counts[cid] = curr
+            if curr > prev:
+                current = song
 
-        for song in all_songs:
-            content = song.Content
-            hot_cues: List[DjmdCue] = [cue for cue in content.Cues if not cue.is_memory_cue]
+        return (current if current else songs[0], new_counts)
 
-            if len(hot_cues) < 4:
-                song_lines.append(f"Skipping '{content.Title}': only {len(hot_cues)} hot cues.")
-                skipped_count += 1
-                continue
+    def get_base_bpm(self, playlist: str, average: bool=False) -> float:
+        """
+        Base BPM = first track’s BPM by default;
+        if average=True, returns the mean BPM across all songs.
+        """
+        songs = self.get_playlist_songs_by_trackno(playlist)
+        bpms = [self.rekordbox_bpm_to_bpm(s.Content.BPM) for s in songs]
+        if not bpms:
+            return 0.0
+        return sum(bpms)/len(bpms) if average else bpms[0]
 
-            hot_cues.sort(key=lambda c: c.InMsec)
-            distances_ms = [
-                hot_cues[i + 1].InMsec - hot_cues[i].InMsec
-                for i in range(len(hot_cues) - 1)
-            ]
-
-            if len(distances_ms) < 2:
-                song_lines.append(f"Skipping '{content.Title}': not enough distances.")
-                skipped_count += 1
-                continue
-
-            distances_ms.sort(reverse=True)
-            max_duration = distances_ms[0] + distances_ms[1]
-            total_duration_ms += max_duration
-
-            song_lines.append(
-                f"#{song.TrackNo} - '{content.Title}': {max_duration} ms "
-                f"({self.format_duration(max_duration)}). "
-                f"Play Count: {content.DJPlayCount}, "
-                f"BPM: {self.rekordbox_bpm_to_bpm(content.BPM)}, "
-                f"Key: {content.Key.ScaleName}"
-            )
-
-        total_duration_str = self.format_duration(total_duration_ms)
-        output.append("=== Song Durations ===")
-        output.extend(song_lines)
-        output.append(f"\n=== Total Set Duration ===")
-        output.append(f"{total_duration_ms} ms ({total_duration_str})")
-        output.append(f"{len(song_lines)} songs processed, {skipped_count} skipped.")
-
-        return "\n".join(output)
-
-    def get_playlist_songs_by_trackno(self, playlist_name: str):
-        # Retrieve songs sorted by TrackNo ascending in the specified playlist
-        playlist = self.get_playlist(playlist_name)
-        if playlist is None:
-            raise ValueError(f"Playlist '{playlist_name}' not found.")
-        return sorted(playlist.Songs, key=lambda song: song.TrackNo)
+    @staticmethod
+    def get_bpm_multiplier(current_bpm: float, base_bpm: float) -> float:
+        """Return current_bpm / base_bpm, or 1.0 if base_bpm is zero."""
+        return current_bpm / base_bpm if base_bpm else 1.0
