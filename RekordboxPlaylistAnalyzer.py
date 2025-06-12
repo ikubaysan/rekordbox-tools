@@ -111,6 +111,12 @@ class RekordboxPlaylistAnalyzer:
         songs = self.get_playlist_songs_by_trackno(playlist)
         return {song.Content.ID: song.Content.DJPlayCount for song in songs}
 
+    def refresh(self):
+        self.db = Rekordbox6Database()
+        self.playlists = {
+            pl.Name: pl for pl in self.db.get_playlist()
+        }
+
     def detect_current_song(
         self,
         playlist: str,
@@ -121,6 +127,7 @@ class RekordboxPlaylistAnalyzer:
         return (current_song, new_counts_map).
         If none incremented, returns the first track.
         """
+        self.refresh()
         songs = self.get_playlist_songs_by_trackno(playlist)
         new_counts = {}
         current = None
