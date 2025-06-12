@@ -67,7 +67,7 @@ def main():
 
         duration_str = format_duration(max_distance_ms)
 
-        report_lines.append(f"#{song.TrackNo} - '{content.Title}': {max_distance_ms} ms ({duration_str})")
+        report_lines.append(f"#{song.TrackNo} - '{content.Title}': {max_distance_ms} ms ({duration_str}). Play Count: {song.Content.DJPlayCount}")
 
     total_duration_str = format_duration(total_duration_ms)
 
