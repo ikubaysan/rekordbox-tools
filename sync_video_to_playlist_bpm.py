@@ -3,10 +3,7 @@
 # Loop an MP4 video and sync its playback speed to your Rekordbox playlist’s BPM.
 #
 # Usage:
-#   python sync_video_to_playlist_bpm.py \
-#       --playlist "My Playlist Name" \
-#       --video "C:/path/to/video.mp4" \
-#       [--average-bpm] [--interval 30]
+#    python sync_video_to_playlist_bpm.py --playlist "My Playlist Name" --video "C:/path/to/video.mp4" [--average-bpm] [--interval 30]
 #
 # Options:
 #   --playlist     Required. Rekordbox playlist name to monitor.
@@ -16,19 +13,16 @@
 #   --interval     Optional. Seconds between BPM checks (default: 30).
 #
 # Example:
-#   python sync_video_to_playlist_bpm.py \
-#       --playlist "Deep House Essentials" \
-#       --video "C:/Users/Me/Videos/ambient_loop.mp4" \
-#       --average-bpm \
-#       --interval 15
+#   python sync_video_to_playlist_bpm.py --playlist "Deep House" --video "C:/Users/Me/Videos/ambient_loop.mp4" --average-bpm --interval 15
 
 import argparse
 import random
 import time
 from datetime import datetime
-import vlc
 
+import os
 from RekordboxPlaylistAnalyzer import RekordboxPlaylistAnalyzer
+vlc = RekordboxPlaylistAnalyzer.load_vlc_module()
 
 def main():
     parser = argparse.ArgumentParser(

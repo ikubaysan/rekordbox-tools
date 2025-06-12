@@ -16,6 +16,9 @@ This is meant to be imported; you do not run this directly.
 from pyrekordbox import Rekordbox6Database
 from pyrekordbox.db6.tables import DjmdPlaylist
 from typing import Dict, Tuple
+import os
+import importlib
+import platform
 
 class RekordboxPlaylistAnalyzer:
     def __init__(self):
@@ -23,6 +26,67 @@ class RekordboxPlaylistAnalyzer:
         self.playlists: Dict[str, DjmdPlaylist] = {
             pl.Name: pl for pl in self.db.get_playlist()
         }
+
+    @staticmethod
+    def load_vlc_module():
+        """
+        Load python-vlc against the VLC install whose bitness matches our Python.
+        Provides a clear error if bitness mismatch is likely.
+        """
+        import ctypes
+        is_64_python = platform.architecture()[0] == "64bit"
+        candidates = (
+            [r"C:\Program Files\VideoLAN\VLC", r"C:\Program Files (x86)\VideoLAN\VLC"]
+            if is_64_python
+            else
+            [r"C:\Program Files (x86)\VideoLAN\VLC", r"C:\Program Files\VideoLAN\VLC"]
+        )
+
+        latest_error = None
+        for vlc_dir in candidates:
+            if not os.path.isdir(vlc_dir):
+                continue
+
+            # Try to check the architecture of libvlc.dll using Windows API
+            libvlc_path = os.path.join(vlc_dir, "libvlc.dll")
+            if os.path.exists(libvlc_path):
+                try:
+                    # Read PE header to determine 32-bit or 64-bit
+                    with open(libvlc_path, 'rb') as f:
+                        f.seek(0x3C)
+                        pe_offset = int.from_bytes(f.read(4), 'little')
+                        f.seek(pe_offset + 4)
+                        machine_type = int.from_bytes(f.read(2), 'little')
+                        if is_64_python and machine_type != 0x8664:
+                            raise RuntimeError(f"VLC at '{vlc_dir}' is 32-bit, but you're using 64-bit Python.")
+                        if not is_64_python and machine_type != 0x14c:
+                            raise RuntimeError(f"VLC at '{vlc_dir}' is 64-bit, but you're using 32-bit Python.")
+                except Exception as e:
+                    latest_error = e
+                    continue
+
+            # 1) register the install directory for DLL resolution
+            handle = os.add_dll_directory(vlc_dir)
+            os.environ["VLC_PLUGIN_PATH"] = os.path.join(vlc_dir, "plugins")
+            orig_cwd = os.getcwd()
+            os.chdir(vlc_dir)
+
+            try:
+                vlc = importlib.import_module("vlc")
+                return vlc
+            except OSError as e:
+                latest_error = e
+                handle.close()
+            finally:
+                os.chdir(orig_cwd)
+
+        msg = (
+                "Could not load libvlc from any of:\n  "
+                + "\n  ".join(candidates)
+        )
+        if latest_error:
+            msg += f"\nLatest error: {latest_error}"
+        raise FileNotFoundError(msg)
 
     @staticmethod
     def rekordbox_bpm_to_bpm(rekordbox_bpm: int) -> float:
