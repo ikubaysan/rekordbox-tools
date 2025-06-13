@@ -14,7 +14,6 @@ This is meant to be imported; you do not run this directly.
 """
 
 from pyrekordbox import Rekordbox6Database
-from pyrekordbox.db6.tables import DjmdPlaylist
 from pyrekordbox.db6.tables import DjmdPlaylist, DjmdCue
 from typing import List, Dict, Optional
 from typing import Dict, Tuple
@@ -173,57 +172,70 @@ class RekordboxPlaylistAnalyzer:
         seconds = (ms % 60000) // 1000
         return f"{minutes}m {seconds}s"
 
-    def analyze_playlist(self, playlist_name: str) -> str:
+    def analyze_playlist(
+        self,
+        playlist_name: str,
+        *,
+        max_songs: Optional[int] = None,
+    ) -> str:
+        """
+        Produce a human-readable analysis of a playlist.
 
+        Parameters
+        ----------
+        playlist_name : str
+            Name of the Rekordbox playlist.
+        max_songs : int | None, optional
+            If provided, only evaluate the first ``max_songs`` entries (by TrackNo).
+        """
         playlist = self.playlists.get(playlist_name)
         if playlist is None:
             return f"Playlist '{playlist_name}' not found."
 
-        output = [f"Playlist '{playlist_name}' found with {len(playlist.Songs)} songs.\n"]
+        # Sort and optionally slice
+        all_songs = sorted(playlist.Songs, key=lambda s: s.TrackNo)
+        if max_songs is not None and max_songs > 0:
+            all_songs = all_songs[:max_songs]
+
+        output_lines = []
+        output_lines.append(f"Playlist '{playlist_name}' contains {len(playlist.Songs)} songs.")
+        output_lines.append(f"Analyzing first {len(all_songs)} songs...\n")
 
         total_duration_ms = 0
-        skipped_count = 0
-        song_lines = []
-
-        all_songs = sorted(playlist.Songs, key=lambda song: song.TrackNo)
+        skipped = 0
 
         for song in all_songs:
             content = song.Content
             hot_cues: List[DjmdCue] = [cue for cue in content.Cues if not cue.is_memory_cue]
 
             if len(hot_cues) < 4:
-                song_lines.append(f"Skipping '{content.Title}': only {len(hot_cues)} hot cues.")
-                skipped_count += 1
+                output_lines.append(f"Skipping '{content.Title}': only {len(hot_cues)} hot cues.")
+                skipped += 1
                 continue
 
             hot_cues.sort(key=lambda c: c.InMsec)
-            distances_ms = [
+            distances = [
                 hot_cues[i + 1].InMsec - hot_cues[i].InMsec
                 for i in range(len(hot_cues) - 1)
             ]
-
-            if len(distances_ms) < 2:
-                song_lines.append(f"Skipping '{content.Title}': not enough distances.")
-                skipped_count += 1
+            if len(distances) < 2:
+                output_lines.append(f"Skipping '{content.Title}': not enough distances.")
+                skipped += 1
                 continue
 
-            distances_ms.sort(reverse=True)
-            max_duration = distances_ms[0] + distances_ms[1]
+            distances.sort(reverse=True)
+            max_duration = distances[0] + distances[1]
             total_duration_ms += max_duration
 
-            song_lines.append(
-                f"#{song.TrackNo} - '{content.Title}': {max_duration} ms "
-                f"({self.format_duration(max_duration)}). "
-                f"Play Count: {content.DJPlayCount}, "
-                f"BPM: {self.rekordbox_bpm_to_bpm(content.BPM)}, "
-                f"Key: {content.Key.ScaleName}"
+            duration_str = self.format_duration(max_duration)
+            bpm_str = f"{self.rekordbox_bpm_to_bpm(content.BPM):.2f}"
+            output_lines.append(
+                f"#{song.TrackNo:03d} – '{content.Title}': {max_duration} ms ({duration_str}); "
+                f"BPM {bpm_str}, Key {content.Key.ScaleName}; Plays {content.DJPlayCount}"
             )
 
-        total_duration_str = self.format_duration(total_duration_ms)
-        output.append("=== Song Durations ===")
-        output.extend(song_lines)
-        output.append(f"\n=== Total Set Duration ===")
-        output.append(f"{total_duration_ms} ms ({total_duration_str})")
-        output.append(f"{len(song_lines)} songs processed, {skipped_count} skipped.")
+        output_lines.append("\n=== Total Set Duration ===")
+        output_lines.append(f"{total_duration_ms} ms ({self.format_duration(total_duration_ms)})")
+        output_lines.append(f"{len(output_lines) - 4} songs processed, {skipped} skipped.")
 
-        return "\n".join(output)
+        return "\n".join(output_lines)
