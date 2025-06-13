@@ -59,6 +59,10 @@ def main():
 
     player = instance.media_player_new()
     media = instance.media_new(str(args.video))
+
+    # Loop the video indefinitely
+    media.add_option("input-repeat=999999")
+
     player.set_media(media)
     player.play()
 
