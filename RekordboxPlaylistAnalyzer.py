@@ -15,6 +15,8 @@ This is meant to be imported; you do not run this directly.
 
 from pyrekordbox import Rekordbox6Database
 from pyrekordbox.db6.tables import DjmdPlaylist
+from pyrekordbox.db6.tables import DjmdPlaylist, DjmdCue
+from typing import List, Dict, Optional
 from typing import Dict, Tuple
 import os
 import importlib
@@ -118,14 +120,17 @@ class RekordboxPlaylistAnalyzer:
         }
 
     def detect_current_song(
-        self,
-        playlist: str,
-        previous_counts: Dict[int, int]
+            self,
+            playlist: str,
+            previous_counts: Dict[int, int],
+            last_known_song: object = None
     ) -> Tuple[object, Dict[int, int]]:
         """
-        Compare current DJPlayCount vs. previous_counts,
-        return (current_song, new_counts_map).
-        If none incremented, returns the first track.
+        Return (current_song, updated_counts).
+        If a DJPlayCount incremented, use that song.
+        If none changed:
+          - Return last_known_song if available.
+          - Else, return the first song in the playlist.
         """
         self.refresh()
         songs = self.get_playlist_songs_by_trackno(playlist)
@@ -140,7 +145,12 @@ class RekordboxPlaylistAnalyzer:
             if curr > prev:
                 current = song
 
-        return (current if current else songs[0], new_counts)
+        if current:
+            return current, new_counts
+        elif last_known_song:
+            return last_known_song, new_counts
+        else:
+            return songs[0], new_counts
 
     def get_base_bpm(self, playlist: str, average: bool=False) -> float:
         """
@@ -157,3 +167,63 @@ class RekordboxPlaylistAnalyzer:
     def get_bpm_multiplier(current_bpm: float, base_bpm: float) -> float:
         """Return current_bpm / base_bpm, or 1.0 if base_bpm is zero."""
         return current_bpm / base_bpm if base_bpm else 1.0
+
+    def format_duration(self, ms: int) -> str:
+        minutes = ms // 60000
+        seconds = (ms % 60000) // 1000
+        return f"{minutes}m {seconds}s"
+
+    def analyze_playlist(self, playlist_name: str) -> str:
+
+        playlist = self.playlists.get(playlist_name)
+        if playlist is None:
+            return f"Playlist '{playlist_name}' not found."
+
+        output = [f"Playlist '{playlist_name}' found with {len(playlist.Songs)} songs.\n"]
+
+        total_duration_ms = 0
+        skipped_count = 0
+        song_lines = []
+
+        all_songs = sorted(playlist.Songs, key=lambda song: song.TrackNo)
+
+        for song in all_songs:
+            content = song.Content
+            hot_cues: List[DjmdCue] = [cue for cue in content.Cues if not cue.is_memory_cue]
+
+            if len(hot_cues) < 4:
+                song_lines.append(f"Skipping '{content.Title}': only {len(hot_cues)} hot cues.")
+                skipped_count += 1
+                continue
+
+            hot_cues.sort(key=lambda c: c.InMsec)
+            distances_ms = [
+                hot_cues[i + 1].InMsec - hot_cues[i].InMsec
+                for i in range(len(hot_cues) - 1)
+            ]
+
+            if len(distances_ms) < 2:
+                song_lines.append(f"Skipping '{content.Title}': not enough distances.")
+                skipped_count += 1
+                continue
+
+            distances_ms.sort(reverse=True)
+            max_duration = distances_ms[0] + distances_ms[1]
+            total_duration_ms += max_duration
+
+            song_lines.append(
+                f"#{song.TrackNo} - '{content.Title}': {max_duration} ms "
+                f"({self.format_duration(max_duration)}). "
+                f"Play Count: {content.DJPlayCount}, "
+                f"BPM: {self.rekordbox_bpm_to_bpm(content.BPM)}, "
+                f"Key: {content.Key.ScaleName}"
+            )
+
+        total_duration_str = self.format_duration(total_duration_ms)
+        output.append("=== Song Durations ===")
+        output.extend(song_lines)
+        output.append(f"\n=== Total Set Duration ===")
+        output.append(f"{total_duration_ms} ms ({total_duration_str})")
+        output.append(f"{len(song_lines)} songs processed, {skipped_count} skipped.")
+
+        return "\n".join(output)

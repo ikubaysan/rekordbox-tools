@@ -55,7 +55,8 @@ def main():
           f"Base BPM ({mode}): {base_bpm:.2f}")
 
     # Set up VLC player
-    instance = vlc.Instance()
+    instance = vlc.Instance('--vout=opengl')
+
     player = instance.media_player_new()
     media = instance.media_new(str(args.video))
     player.set_media(media)
@@ -77,14 +78,17 @@ def main():
 
     # Initialize play-count tracking
     prev_counts = analyzer.init_play_counts(args.playlist)
+    last_known_song = None
 
     # Main loop
     while True:
         time.sleep(args.interval)
 
         current, prev_counts = analyzer.detect_current_song(
-            args.playlist, prev_counts
+            args.playlist, prev_counts, last_known_song
         )
+        last_known_song = current  # Update memory of last song
+
         curr_bpm = analyzer.rekordbox_bpm_to_bpm(current.Content.BPM)
         mult = analyzer.get_bpm_multiplier(curr_bpm, base_bpm)
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -92,7 +96,8 @@ def main():
         print(
             f"[{timestamp}] "
             f"Song #{current.TrackNo} – \"{current.Content.Title}\" | "
-            f"{curr_bpm:.2f} BPM → rate {mult:.2f}x"
+            f"{curr_bpm:.2f} BPM → rate {mult:.2f}x of "
+            f"base {base_bpm:.2f} BPM"
         )
 
         player.set_rate(mult)

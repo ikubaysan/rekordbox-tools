@@ -39,12 +39,15 @@ def main():
         print(e)
         return
 
+    last_known_song = None
     print(f"Monitoring '{args.playlist}' every {args.interval}s…")
 
     while True:
         current, prev_counts = analyzer.detect_current_song(
-            args.playlist, prev_counts
+            args.playlist, prev_counts, last_known_song
         )
+        last_known_song = current
+
         bpm = analyzer.rekordbox_bpm_to_bpm(current.Content.BPM)
         print(
             f"→ Now playing: "
