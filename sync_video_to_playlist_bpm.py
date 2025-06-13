@@ -44,6 +44,10 @@ def main():
         "--interval", type=int, default=30,
         help="Seconds between BPM checks (default: 30)"
     )
+    parser.add_argument(
+        "--max-playback-rate", type=float, default=None,
+        help="If set, use dynamic playback rate - 1x on the lowest BPM, and this multiplier on the highest BPM"
+    )
     args = parser.parse_args()
 
     analyzer = RekordboxPlaylistAnalyzer()
@@ -53,6 +57,23 @@ def main():
     mode = "average" if args.average_bpm else "first track"
     print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] "
           f"Base BPM ({mode}): {base_bpm:.2f}")
+
+    if args.max_playback_rate:
+        bpms = [
+            analyzer.rekordbox_bpm_to_bpm(s.Content.BPM)
+            for s in analyzer.get_playlist_songs_by_trackno(args.playlist)
+        ]
+        min_bpm = min(bpms)
+        max_bpm = max(bpms)
+        print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] "
+              f"Dynamic scaling enabled: Min BPM in this playlist is {min_bpm:.2f}, Max BPM is {max_bpm:.2f} BPM. "
+              f"Rates to be used: 1.0–{args.max_playback_rate:.2f}x")
+    else:
+        min_bpm = base_bpm
+        max_bpm = base_bpm
+        print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] "
+              f"Static scaling: 1.0x for {base_bpm:.2f} BPM, adjusting rate based on how many "
+              f"X faster or slower the current song is compared to this base BPM.")
 
     # Set up VLC player
     instance = vlc.Instance('--vout=opengl')
@@ -94,14 +115,19 @@ def main():
         last_known_song = current  # Update memory of last song
 
         curr_bpm = analyzer.rekordbox_bpm_to_bpm(current.Content.BPM)
-        mult = analyzer.get_bpm_multiplier(curr_bpm, base_bpm)
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        if args.max_playback_rate:
+            mult = 1.0 + ((curr_bpm - base_bpm) / (max_bpm - base_bpm)) * (args.max_playback_rate - 1.0)
+        else:
+            mult = analyzer.get_bpm_multiplier(curr_bpm, base_bpm)
+
 
         print(
             f"[{timestamp}] "
             f"Song #{current.TrackNo} – \"{current.Content.Title}\" | "
-            f"{curr_bpm:.2f} BPM → rate {mult:.2f}x of "
-            f"base {base_bpm:.2f} BPM"
+            f"Current BPM: {curr_bpm:.2f} | Base BPM based on {mode}: {base_bpm:.2f} | Playback rate: {mult:.2f}x | "
+            f"Max playback rate: {round(args.max_playback_rate, 2) if args.max_playback_rate else 'N/A'}"
         )
 
         player.set_rate(mult)
