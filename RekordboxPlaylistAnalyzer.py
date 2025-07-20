@@ -203,6 +203,7 @@ class RekordboxPlaylistAnalyzer:
 
         total_duration_ms = 0
         skipped = 0
+        all_bpms = []
 
         for song in all_songs:
             content = song.Content
@@ -223,6 +224,7 @@ class RekordboxPlaylistAnalyzer:
                 skipped += 1
                 continue
 
+            all_bpms.append(self.rekordbox_bpm_to_bpm(content.BPM))
             distances.sort(reverse=True)
             max_duration = distances[0] + distances[1]
             total_duration_ms += max_duration
