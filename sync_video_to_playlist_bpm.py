@@ -55,6 +55,11 @@ def main():
     print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] Base BPM ({mode}): {base_bpm:.2f}")
 
     if args.max_playback_rate:
+
+        # Must be 1.0 or greater
+        if args.max_playback_rate < 1.0:
+            raise ValueError("max_playback_rate must be 1.0 or greater")
+
         bpms = [
             analyzer.rekordbox_bpm_to_bpm(s.Content.BPM)
             for s in analyzer.get_playlist_songs_by_trackno(args.playlist)
@@ -63,7 +68,7 @@ def main():
         max_bpm = max(bpms)
         print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] "
               f"Dynamic scaling enabled: Min BPM in this playlist is {min_bpm:.2f}, Max BPM is {max_bpm:.2f} BPM. "
-              f"Rates to be used: 1.0–{args.max_playback_rate:.2f}x")
+              f"Max playback rate: {args.max_playback_rate:.2f}x")
     else:
         min_bpm = base_bpm
         max_bpm = base_bpm

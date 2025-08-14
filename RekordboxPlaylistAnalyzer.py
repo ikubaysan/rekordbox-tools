@@ -173,26 +173,15 @@ class RekordboxPlaylistAnalyzer:
         return f"{minutes}m {seconds}s"
 
     def analyze_playlist(
-        self,
-        playlist_name: str,
-        *,
-        max_songs: Optional[int] = None,
+            self,
+            playlist_name: str,
+            *,
+            max_songs: Optional[int] = None,
     ) -> str:
-        """
-        Produce a human-readable analysis of a playlist.
-
-        Parameters
-        ----------
-        playlist_name : str
-            Name of the Rekordbox playlist.
-        max_songs : int | None, optional
-            If provided, only evaluate the first ``max_songs`` entries (by TrackNo).
-        """
         playlist = self.playlists.get(playlist_name)
         if playlist is None:
             return f"Playlist '{playlist_name}' not found."
 
-        # Sort and optionally slice
         all_songs = sorted(playlist.Songs, key=lambda s: s.TrackNo)
         if max_songs is not None and max_songs > 0:
             all_songs = all_songs[:max_songs]
@@ -202,8 +191,9 @@ class RekordboxPlaylistAnalyzer:
         output_lines.append(f"Analyzing first {len(all_songs)} songs...\n")
 
         total_duration_ms = 0
+        total_adjusted_duration_ms = 0
         skipped = 0
-        all_bpms = []
+        prev_bpm = None
 
         for song in all_songs:
             content = song.Content
@@ -224,20 +214,46 @@ class RekordboxPlaylistAnalyzer:
                 skipped += 1
                 continue
 
-            all_bpms.append(self.rekordbox_bpm_to_bpm(content.BPM))
             distances.sort(reverse=True)
             max_duration = distances[0] + distances[1]
-            total_duration_ms += max_duration
-
             duration_str = self.format_duration(max_duration)
-            bpm_str = f"{self.rekordbox_bpm_to_bpm(content.BPM):.2f}"
+
+            current_bpm = self.rekordbox_bpm_to_bpm(content.BPM)
+            bpm_info = f"BPM {current_bpm:.2f}"
+            adjusted_duration = max_duration
+
             output_lines.append(
                 f"#{song.TrackNo:03d} – '{content.Title}': {max_duration} ms ({duration_str}); "
-                f"BPM {bpm_str}, Key {content.Key.ScaleName}; Plays {content.DJPlayCount}"
+                f"{bpm_info}, Key {content.Key.ScaleName}; Plays {content.DJPlayCount}"
             )
 
+            if prev_bpm is not None:
+                bpm_diff = current_bpm - prev_bpm
+                tempo_shift = -bpm_diff / 2  # slow down or speed up by half the difference
+                adjusted_bpm = current_bpm + tempo_shift
+                ratio = current_bpm / adjusted_bpm if adjusted_bpm != 0 else 1
+                adjusted_duration = int(max_duration * ratio)
+
+                output_lines.append(
+                    f"  * Adjusting tempo from {current_bpm:.2f} to {adjusted_bpm:.2f} BPM "
+                    f"to meet halfway to previous BPM ({prev_bpm:.2f})"
+                )
+                output_lines.append(
+                    f"  * Estimated adjusted playtime: {adjusted_duration} ms "
+                    f"({self.format_duration(adjusted_duration)})"
+                )
+            else:
+                output_lines.append("  ⮩ No previous BPM to compare for tempo adjustment.")
+
+            prev_bpm = current_bpm
+            total_duration_ms += max_duration
+            total_adjusted_duration_ms += adjusted_duration
+
         output_lines.append("\n=== Total Set Duration ===")
-        output_lines.append(f"{total_duration_ms} ms ({self.format_duration(total_duration_ms)})")
-        output_lines.append(f"{len(output_lines) - 4} songs processed, {skipped} skipped.")
+        output_lines.append(f"Original: {total_duration_ms} ms ({self.format_duration(total_duration_ms)})")
+        output_lines.append(f"Adjusted (half BPM diff per song): {total_adjusted_duration_ms} ms "
+                            f"({self.format_duration(total_adjusted_duration_ms)})")
+        output_lines.append(f"{len(output_lines) - 5} songs processed, {skipped} skipped.")
 
         return "\n".join(output_lines)
+
