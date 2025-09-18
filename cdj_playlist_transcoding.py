@@ -12,7 +12,7 @@
 #   Creates "<playlist>_<fmt>" next to this script, where <fmt> is "aiff" or
 #   "mp3_320". Filenames are "<original_stem>_<fmt>.<ext>".
 #   Title tag is suffixed with " (AIFF)" or " (320 mp3)".
-#   Artwork is copied from the source (MP3 ID3 APIC, M4A/MP4 covr, FLAC picture).
+#   Artwork and common metadata are copied from the source.
 # ---------------------------------------------------------------------------
 
 import argparse
@@ -20,13 +20,16 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Optional, Iterable, Tuple
+from typing import Optional, Iterable, Tuple, Dict, Any
 
 from RekordboxPlaylistAnalyzer import RekordboxPlaylistAnalyzer
 
 # --- Artwork/metadata helpers (mutagen) ---
 from mutagen import File as MutagenFile
-from mutagen.id3 import ID3, APIC, TIT2, ID3NoHeaderError, PIC
+from mutagen.id3 import (
+    ID3, APIC, TIT2, TALB, TPE1, TPE2, TCON, TYER, TRCK, TPOS, COMM, TCOM,
+    ID3NoHeaderError, PIC
+)
 from mutagen.flac import FLAC
 from mutagen.mp4 import MP4, MP4Cover
 from mutagen.aiff import AIFF
@@ -140,7 +143,7 @@ def unique_with_counter(base_path: Path) -> Path:
             return candidate
         i += 1
 
-# ------------------ Artwork extraction / embedding ------------------
+# ------------------ Artwork extraction ------------------
 
 def _get_cover_from_src(src_path: Path) -> Optional[Tuple[bytes, str]]:
     """
@@ -153,7 +156,6 @@ def _get_cover_from_src(src_path: Path) -> Optional[Tuple[bytes, str]]:
 
     # MP3 (ID3)
     if hasattr(audio, "tags") and isinstance(audio.tags, ID3):
-        # Prefer APIC (ID3v2.3/2.4), fallback to PIC (ID3v2.2)
         apics = audio.tags.getall("APIC")
         if apics:
             apic = apics[0]
@@ -164,7 +166,6 @@ def _get_cover_from_src(src_path: Path) -> Optional[Tuple[bytes, str]]:
         if pics:
             pic = pics[0]
             if getattr(pic, "data", None):
-                # PIC may not have a canonical mime; assume JPEG if unspecified
                 mime = getattr(pic, "mime", None) or "image/jpeg"
                 return bytes(pic.data), mime
 
@@ -188,39 +189,190 @@ def _get_cover_from_src(src_path: Path) -> Optional[Tuple[bytes, str]]:
 
     return None
 
-def _embed_cover_and_title_mp3(dst_path: Path, title: Optional[str], cover: Optional[Tuple[bytes, str]]) -> None:
-    """Ensure ID3v2.3 on MP3, write Title and APIC cover."""
+# ------------------ Common metadata extraction ------------------
+
+def _get_text(v: Any) -> Optional[str]:
+    if v is None:
+        return None
+    if isinstance(v, (list, tuple)):
+        if not v:
+            return None
+        v = v[0]
+    try:
+        s = str(v).strip()
+        return s or None
+    except Exception:
+        return None
+
+def _read_common_tags(src: Path) -> Dict[str, Optional[str]]:
+    """
+    Return a dict of common tags from the source file:
+      album, artist, albumartist, date(year), track, track_total, disc, disc_total, genre, comment, composer
+    """
+    info = {
+        "album": None,
+        "artist": None,
+        "albumartist": None,
+        "date": None,           # 'YYYY' preferred
+        "track": None,          # e.g. "5" or "5/12"
+        "disc": None,           # e.g. "1" or "1/2"
+        "genre": None,
+        "comment": None,
+        "composer": None,
+    }
+
+    audio = MutagenFile(src, easy=False)
+    if audio is None:
+        return info
+
+    # MP3/ID3
+    if isinstance(audio.tags, ID3):
+        tags = audio.tags
+        info["album"] = _get_text(tags.get("TALB"))
+        info["artist"] = _get_text(tags.get("TPE1"))
+        info["albumartist"] = _get_text(tags.get("TPE2"))  # often used as album artist
+        # Year: in v2.3 it's TYER
+        year = _get_text(tags.get("TYER"))
+        info["date"] = year
+        info["genre"] = _get_text(tags.get("TCON"))
+        # Track and disc numbers
+        trck = _get_text(tags.get("TRCK"))
+        tpos = _get_text(tags.get("TPOS"))
+        info["track"] = trck
+        info["disc"] = tpos
+        # Comment (take the first COMM)
+        comms = tags.getall("COMM")
+        if comms:
+            info["comment"] = _get_text(comms[0].text if hasattr(comms[0], "text") else None)
+        info["composer"] = _get_text(tags.get("TCOM"))
+        return info
+
+    # MP4/M4A
+    if isinstance(audio, MP4):
+        tags = audio.tags or {}
+        info["album"] = _get_text(tags.get("\xa9alb"))
+        info["artist"] = _get_text(tags.get("\xa9ART"))
+        info["albumartist"] = _get_text(tags.get("aART"))
+        # Prefer YYYY from ©day
+        day = _get_text(tags.get("\xa9day"))
+        if day and len(day) >= 4 and day[:4].isdigit():
+            info["date"] = day[:4]
+        # Track/disc are tuples like [(num, total)]
+        trkn = tags.get("trkn")
+        if trkn and isinstance(trkn, list) and trkn[0]:
+            n, total = trkn[0][0], trkn[0][1]
+            if n:
+                info["track"] = f"{n}/{total}" if total else f"{n}"
+        disk = tags.get("disk")
+        if disk and isinstance(disk, list) and disk[0]:
+            n, total = disk[0][0], disk[0][1]
+            if n:
+                info["disc"] = f"{n}/{total}" if total else f"{n}"
+        info["genre"] = _get_text(tags.get("\xa9gen"))
+        info["comment"] = _get_text(tags.get("\xa9cmt"))
+        info["composer"] = _get_text(tags.get("\xa9wrt"))
+        return info
+
+    # FLAC/Vorbis
+    if isinstance(audio, FLAC):
+        tags = audio.tags or {}
+        def g(key): return _get_text(tags.get(key))
+        info["album"] = g("album")
+        info["artist"] = g("artist")
+        info["albumartist"] = g("albumartist")
+        date = g("date") or g("year")
+        if date and len(date) >= 4 and date[:4].isdigit():
+            info["date"] = date[:4]
+        # Track/disc
+        tn = g("tracknumber")
+        tt = g("tracktotal") or g("totaltracks")
+        if tn:
+            info["track"] = f"{tn}/{tt}" if tt else tn
+        dn = g("discnumber")
+        dt = g("disctotal") or g("totaldiscs")
+        if dn:
+            info["disc"] = f"{dn}/{dt}" if dt else dn
+        info["genre"] = g("genre")
+        info["comment"] = g("comment")
+        info["composer"] = g("composer")
+        return info
+
+    # Fallback for others via Easy tags if possible
+    easy = MutagenFile(src, easy=True)
+    if easy and easy.tags:
+        et = easy.tags
+        def eg(k): return _get_text(et.get(k))
+        info["album"] = eg("album")
+        info["artist"] = eg("artist")
+        info["albumartist"] = eg("albumartist")
+        date = eg("date") or eg("year")
+        if date and len(date) >= 4 and date[:4].isdigit():
+            info["date"] = date[:4]
+        tn = eg("tracknumber")
+        tt = eg("tracktotal")
+        if tn:
+            info["track"] = f"{tn}/{tt}" if tt else tn
+        dn = eg("discnumber")
+        dt = eg("disctotal")
+        if dn:
+            info["disc"] = f"{dn}/{dt}" if dt else dn
+        info["genre"] = eg("genre")
+        info["comment"] = eg("comment")
+        info["composer"] = eg("composer")
+    return info
+
+# ------------------ ID3 writing helpers ------------------
+
+def _apply_common_id3_frames(id3_obj: ID3, common: Dict[str, Optional[str]], title: Optional[str], cover: Optional[Tuple[bytes, str]]):
+    # Title
+    if title:
+        id3_obj.setall("TIT2", [TIT2(encoding=3, text=title)])
+
+    # Common text frames
+    if common.get("album"):
+        id3_obj.setall("TALB", [TALB(encoding=3, text=common["album"])])
+    if common.get("artist"):
+        id3_obj.setall("TPE1", [TPE1(encoding=3, text=common["artist"])])
+    if common.get("albumartist"):
+        id3_obj.setall("TPE2", [TPE2(encoding=3, text=common["albumartist"])])
+    if common.get("genre"):
+        id3_obj.setall("TCON", [TCON(encoding=3, text=common["genre"])])
+    if common.get("composer"):
+        id3_obj.setall("TCOM", [TCOM(encoding=3, text=common["composer"])])
+
+    # Year (ID3v2.3: TYER)
+    if common.get("date"):
+        id3_obj.setall("TYER", [TYER(encoding=3, text=common["date"])])
+
+    # Track / Disc numbers (text like "5/12")
+    if common.get("track"):
+        id3_obj.setall("TRCK", [TRCK(encoding=3, text=common["track"])])
+    if common.get("disc"):
+        id3_obj.setall("TPOS", [TPOS(encoding=3, text=common["disc"])])
+
+    # Comment (use lang 'eng', desc empty)
+    if common.get("comment"):
+        id3_obj.setall("COMM", [COMM(encoding=3, lang="eng", desc="", text=common["comment"])])
+
+    # Cover art
+    if cover:
+        img_bytes, mime = cover
+        id3_obj.setall("APIC", [APIC(encoding=3, mime=mime, type=3, desc="Cover", data=img_bytes)])
+
+def _embed_all_mp3(dst_path: Path, title: Optional[str], cover: Optional[Tuple[bytes, str]], common: Dict[str, Optional[str]]) -> None:
     try:
         tags = ID3(dst_path)
     except ID3NoHeaderError:
         tags = ID3()
-
-    if title:
-        tags.setall("TIT2", [TIT2(encoding=3, text=title)])
-
-    if cover:
-        img_bytes, mime = cover
-        tags.setall("APIC", [APIC(encoding=3, mime=mime, type=3, desc="Cover", data=img_bytes)])
-
+    _apply_common_id3_frames(tags, common, title, cover)
     tags.save(dst_path, v2_version=3)
 
-def _embed_cover_and_title_aiff(dst_path: Path, title: Optional[str], cover: Optional[Tuple[bytes, str]]) -> None:
-    """
-    Use mutagen.aiff.AIFF to attach/create an ID3 chunk and write Title + APIC.
-    This keeps the AIFF container's chunk sizes/ordering valid.
-    """
+def _embed_all_aiff(dst_path: Path, title: Optional[str], cover: Optional[Tuple[bytes, str]], common: Dict[str, Optional[str]]) -> None:
     aiff = AIFF(dst_path)
     if aiff.tags is None:
-        aiff.add_tags()  # creates an empty ID3 tag chunk
-
+        aiff.add_tags()  # create an empty ID3 chunk
     id3 = aiff.tags
-    if title:
-        id3.setall("TIT2", [TIT2(encoding=3, text=title)])
-
-    if cover:
-        img_bytes, mime = cover
-        id3.setall("APIC", [APIC(encoding=3, mime=mime, type=3, desc="Cover", data=img_bytes)])
-
+    _apply_common_id3_frames(id3, common, title, cover)
     aiff.save(v2_version=3)
 
 # ------------------ ffmpeg converters ------------------
@@ -228,7 +380,7 @@ def _embed_cover_and_title_aiff(dst_path: Path, title: Optional[str], cover: Opt
 def convert_to_mp3_320(ffmpeg: str, src: Path, dst: Path, title_for_tag: Optional[str]) -> int:
     """
     Convert src to MP3 320kbps CBR at dst.
-    (We still write title via ffmpeg, and later enforce via mutagen as well.)
+    We let ffmpeg copy container-level metadata, then enforce ID3 via mutagen.
     """
     dst.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
@@ -259,7 +411,7 @@ def convert_to_mp3_320(ffmpeg: str, src: Path, dst: Path, title_for_tag: Optiona
 def convert_to_aiff_pcm_24bit(ffmpeg: str, src: Path, dst: Path, title_for_tag: Optional[str]) -> int:
     """
     Convert src to uncompressed AIFF at 24-bit PCM (pcm_s24be) at dst.
-    IMPORTANT: we do NOT ask ffmpeg to write ID3 here; mutagen will handle it.
+    We do NOT try to write ID3 in ffmpeg; mutagen will write a proper ID3 chunk.
     """
     dst.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
@@ -270,8 +422,7 @@ def convert_to_aiff_pcm_24bit(ffmpeg: str, src: Path, dst: Path, title_for_tag: 
         "-i", str(src),
         "-vn",
         "-c:a", "pcm_s24be",     # always 24-bit big-endian
-        "-map_metadata", "0",    # copy non-image source tags to the container (safe)
-        # No -write_id3v2 here; mutagen writes the ID3 chunk cleanly afterwards.
+        "-map_metadata", "0",    # harmless; AIFF ID3 will be handled by mutagen
     ]
     if title_for_tag:
         cmd += ["-metadata", f"title={title_for_tag}"]
@@ -344,25 +495,28 @@ def main():
         print(f"    src: {src}")
         print(f"    dst: {dst}")
 
+        # Convert
         if args.format == "aiff":
             rc = convert_to_aiff_pcm_24bit(ffmpeg, src, dst, transcoded_title)
         else:
             rc = convert_to_mp3_320(ffmpeg, src, dst, transcoded_title)
 
         if rc == 0:
-            # After conversion, embed artwork (and title again) for reliability
+            # After conversion, embed artwork + full tag set for reliability
             cover = _get_cover_from_src(src)
+            common = _read_common_tags(src)
             try:
                 if args.format == "aiff":
-                    _embed_cover_and_title_aiff(dst, transcoded_title, cover)
+                    _embed_all_aiff(dst, transcoded_title, cover, common)
                 else:
-                    _embed_cover_and_title_mp3(dst, transcoded_title, cover)
+                    _embed_all_mp3(dst, transcoded_title, cover, common)
             except Exception as e:
-                print(f"[warn] Could not embed artwork on '{dst.name}': {e}")
+                print(f"[warn] Could not embed tags on '{dst.name}': {e}")
             converted += 1
         else:
             failures += 1
 
+        # Maintain file creation order for easy drag/drop sorting
         time.sleep(2)
 
     print("\n=== Summary ===")
