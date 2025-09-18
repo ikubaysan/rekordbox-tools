@@ -4,15 +4,11 @@
 # Compare two Rekordbox playlists (Base vs Candidate) and print:
 #  • song counts for both
 #  • which tracks match in both
-#  • hot-cue counts for each matched track (and flag mismatches)
+#  • hot-cue counts for each matched track
+#  • if hot-cue COUNT matches, also compare hot-cue TIMESTAMPS with ±1s tolerance
 #  • which are missing or extra
 #  • if NO tracks are missing: check per-track TrackNo alignment and
 #    suggest the candidate TrackNo that should match the base
-#
-# Matching order:
-#  1) artist+title
-#  2) fallback filename stem
-#  3) title-only (unless --no-title-fallback)
 
 import argparse, os, re, sys, unicodedata
 from dataclasses import dataclass
@@ -24,6 +20,8 @@ from RekordboxPlaylistAnalyzer import RekordboxPlaylistAnalyzer
 
 _SUFFIX_TITLE_RE = re.compile(r"\s*\((?:320\s*mp3|AIFF|Transcoded)\)\s*$", re.IGNORECASE)
 _NON_ALNUM_RE = re.compile(r"[^0-9a-z]+", re.IGNORECASE)
+
+# --- Normalization helpers ---------------------------------------------------
 
 def _norm(s: Optional[str]) -> str:
     if not s: return ""
@@ -91,22 +89,51 @@ def _artist_text(c) -> str:
 def _title_text(c) -> str:
     return _strip_transcode_suffix_from_title(getattr(c,"Title","") or "")
 
-def _hot_cue_count(c) -> int:
-    """
-    Count HOT cues only (exclude memory cues).
-    Defensive against odd cue objects.
-    """
+# --- Hot-cue helpers ---------------------------------------------------------
+
+def _hot_cue_positions_ms(c) -> List[int]:
     cues = getattr(c, "Cues", None)
     if not isinstance(cues, (list, tuple)):
-        return 0
-    count = 0
+        return []
+    out = []
     for cue in cues:
-        # Rekordbox: DjmdCue has .is_memory_cue; treat False/absent as hot cue
-        is_mem = getattr(cue, "is_memory_cue", None)
-        if is_mem is True:
+        if getattr(cue, "is_memory_cue", None) is True:
             continue
-        count += 1
-    return count
+        ms = getattr(cue, "InMsec", None)
+        if isinstance(ms, int):
+            out.append(ms)
+    out.sort()
+    return out
+
+def _match_hot_cue_positions(base_ms: List[int], cand_ms: List[int], tol_ms: int):
+    used = [False] * len(cand_ms)
+    matched_pairs = []
+    unmatched_base = []
+    for b in base_ms:
+        found_j = None
+        best_abs_diff = None
+        for j, cm in enumerate(cand_ms):
+            if used[j]:
+                continue
+            diff = abs(cm - b)
+            if diff <= tol_ms and (best_abs_diff is None or diff < best_abs_diff):
+                best_abs_diff = diff
+                found_j = j
+        if found_j is None:
+            unmatched_base.append(b)
+        else:
+            used[found_j] = True
+            matched_pairs.append((b, cand_ms[found_j]))
+    unmatched_cand = [cand_ms[j] for j, u in enumerate(used) if not u]
+    return matched_pairs, unmatched_base, unmatched_cand
+
+def _fmt_ms(ms: int) -> str:
+    s = ms // 1000
+    m = s // 60
+    s = s % 60
+    return f"{m}:{s:02d} ({ms}ms)"
+
+# --- Core record -------------------------------------------------------------
 
 @dataclass
 class Rec:
@@ -114,8 +141,9 @@ class Rec:
     title_norm: str
     fb_norm: Optional[str]
     label: str
-    track_no: int      # Track number in its respective playlist
-    hot_cues: int      # Count of hot cues on this track
+    track_no: int
+    hot_cues: int
+    hot_cue_ms: List[int]
 
 def _mk_rec(song) -> Rec:
     c = song.Content
@@ -125,17 +153,21 @@ def _mk_rec(song) -> Rec:
     p = _guess_content_path(c)
     if p: fb = _norm(_strip_file_suffixes(p.stem))
     label = f"{artist} — {title}" if artist else title
+    hot_ms = _hot_cue_positions_ms(c)
     return Rec(
         artist_norm=_norm(artist),
         title_norm=_norm(title),
         fb_norm=fb,
         label=label,
         track_no=int(getattr(song, "TrackNo", 0) or 0),
-        hot_cues=_hot_cue_count(c),
+        hot_cues=len(hot_ms),
+        hot_cue_ms=hot_ms,
     )
 
 def _playlist_entries(analyzer: RekordboxPlaylistAnalyzer,name:str)->List[Rec]:
     return [_mk_rec(s) for s in analyzer.get_playlist_songs_by_trackno(name)]
+
+# --- Matching logic ----------------------------------------------------------
 
 def _index_many(values: List[int], key_fn):
     d=defaultdict(list)
@@ -156,21 +188,18 @@ def _match(base:List[Rec],cand:List[Rec],title_fb=True) -> Tuple[List[Tuple[Rec,
 
     def cand_idx(): return [i for i in range(nc) if not used_c[i]]
 
-    # pass1: artist+title
     b=_index_many(cand_idx(),lambda i:f"{cand[i].artist_norm}|{cand[i].title_norm}")
     for i in range(nb):
         if used_b[i]: continue
         j=_pop(b,f"{base[i].artist_norm}|{base[i].title_norm}")
         if j is not None: used_b[i]=used_c[j]=True; matches.append((base[i],cand[j]))
 
-    # pass2: filename stem
     b=_index_many(cand_idx(),lambda i:cand[i].fb_norm)
     for i in range(nb):
         if used_b[i] or not base[i].fb_norm: continue
         j=_pop(b,base[i].fb_norm)
         if j is not None: used_b[i]=used_c[j]=True; matches.append((base[i],cand[j]))
 
-    # pass3: title only
     if title_fb:
         b=_index_many(cand_idx(),lambda i:cand[i].title_norm)
         for i in range(nb):
@@ -182,11 +211,14 @@ def _match(base:List[Rec],cand:List[Rec],title_fb=True) -> Tuple[List[Tuple[Rec,
     extra=[cand[i] for i in range(nc) if not used_c[i]]
     return matches,missing,extra
 
+# --- Main --------------------------------------------------------------------
+
 def main():
     ap=argparse.ArgumentParser()
     ap.add_argument("--base",required=True)
     ap.add_argument("--candidate",required=True)
     ap.add_argument("--no-title-fallback",action="store_true")
+    ap.add_argument("--hotcue-tolerance-ms", type=int, default=100)
     args=ap.parse_args()
 
     a=RekordboxPlaylistAnalyzer()
@@ -202,50 +234,45 @@ def main():
     print(f"Base     : {args.base} ({len(base)} tracks)")
     print(f"Candidate: {args.candidate} ({len(cand)} tracks)\n")
 
+    hotcue_count_mismatches = []
+    hotcue_placement_mismatches = []
+
+    tol = args.hotcue_tolerance_ms
+
     print(f"✅ Matched in both ({len(matches)}):")
-    hotcue_mismatches = []
     for b,c in matches:
-        same = (b.hot_cues == c.hot_cues)
-        flag = " " if same else " ⚠️"
-        print(f"  ={flag} {b.label}")
+        counts_equal = (b.hot_cues == c.hot_cues)
+        marker = " " if counts_equal else " ⚠️"
+        print(f"  ={marker} {b.label}")
         print(f"       • TrackNo: base #{b.track_no} | cand #{c.track_no}")
-        print(f"       • Hot cues: base {b.hot_cues} | cand {c.hot_cues}")
-        if not same:
-            hotcue_mismatches.append((b,c))
+        print(f"       • Hot cues (count): base {b.hot_cues} | cand {c.hot_cues}")
+
+        if not counts_equal:
+            hotcue_count_mismatches.append((b,c))
+        else:
+            pairs, unmatched_b, unmatched_c = _match_hot_cue_positions(b.hot_cue_ms, c.hot_cue_ms, tol_ms=tol)
+            if unmatched_b or unmatched_c:
+                hotcue_placement_mismatches.append((b, c, unmatched_b, unmatched_c))
+                print(f"       • Hot cues (placement): ❌ mismatch within ±{tol}ms")
+            else:
+                print(f"       • Hot cues (placement): ✅ all matched within ±{tol}ms")
     print()
 
-    if hotcue_mismatches:
-        print(f"⚠️  Hot-cue count mismatches ({len(hotcue_mismatches)}):")
-        for b,c in hotcue_mismatches:
-            print(f"  • {b.label}: base {b.hot_cues} vs cand {c.hot_cues}")
-        print()
-
     if missing:
-        print(f"❌ Missing in Candidate ({len(missing)}):")
-        for r in missing: print(f"  - {r.label}")
-        print()
+        print(f"❌ Missing in Candidate ({len(missing)})")
     if extra:
-        print(f"➕ Additional in Candidate ({len(extra)}):")
-        for r in extra: print(f"  + {r.label}")
-        print()
+        print(f"➕ Additional in Candidate ({len(extra)})")
 
-    # If nothing is missing, check track numbers alignment
-    if not missing:
-        misaligned = [(b, c) for (b,c) in matches if b.track_no != c.track_no]
-        if not misaligned:
-            print("🔢 Track numbers: all aligned with base.")
-        else:
-            print(f"🔢 Track numbers: {len(misaligned)} not aligned. Suggested candidate TrackNo → base TrackNo:")
-            for b, c in sorted(misaligned, key=lambda t: t[0].track_no):
-                print(f"  • {b.label}\n"
-                      f"      candidate #{c.track_no} ⇒ should be #{b.track_no}")
-        print()
+    misaligned = [(b,c) for (b,c) in matches if b.track_no != c.track_no]
 
-    # exit code
-    # 0 if contents equal (ignoring TrackNo differences); 1 otherwise
-    if not missing and not extra:
-        sys.exit(0 if not [(b,c) for (b,c) in matches if b.track_no != c.track_no] else 1)
-    sys.exit(1)
+    all_ok = (not missing and not extra and not hotcue_count_mismatches and not hotcue_placement_mismatches and not misaligned)
+    print()
+    if all_ok:
+        print("✅ All content matches")
+    else:
+        print("❌ Content differs")
+
+    sys.exit(0 if all_ok else 1)
 
 if __name__=="__main__":
     main()
