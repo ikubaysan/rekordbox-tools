@@ -1,14 +1,17 @@
 #!/usr/bin/env python
 # ---------------------------------------------------------------------------
-# Convert all tracks from a Rekordbox playlist to MP3 320kbps.
+# Convert all tracks from a Rekordbox playlist to either:
+#   - Uncompressed AIFF (default), or
+#   - MP3 320kbps CBR.
 #
 # Usage:
-#   python convert_playlist_to_mp3_320.py --playlist "My Playlist"
-#   python convert_playlist_to_mp3_320.py --playlist "My Playlist" -n 25
+#   python convert_playlist_audio.py --playlist "My Playlist"
+#   python convert_playlist_audio.py --playlist "My Playlist" --format mp3
 #
 # Output:
-#   Creates a folder "<playlist>_mp3_320" next to this script.
-#   Each output file is named "<original_stem>_mp3_320.mp3".
+#   Creates a folder "<playlist>_<fmt>" next to this script, where <fmt> is
+#   "aiff" or "mp3_320". Each output file is named "<original_stem>_<fmt>.<ext>".
+#   The output file’s Title tag is suffixed with " (Transcoded)".
 # ---------------------------------------------------------------------------
 
 import argparse
@@ -132,7 +135,7 @@ def unique_with_counter(base_path: Path) -> Path:
             return candidate
         i += 1
 
-def convert_to_mp3_320(ffmpeg: str, src: Path, dst: Path) -> int:
+def convert_to_mp3_320(ffmpeg: str, src: Path, dst: Path, title_for_tag: Optional[str]) -> int:
     """
     Convert src to MP3 320kbps CBR at dst.
     Returns ffmpeg returncode (0 on success).
@@ -141,20 +144,21 @@ def convert_to_mp3_320(ffmpeg: str, src: Path, dst: Path) -> int:
     cmd = [
         ffmpeg,
         "-hide_banner", "-nostdin",
-        "-loglevel", "error",     # only show errors (keeps output small/clean)
+        "-loglevel", "error",
         "-y",
         "-i", str(src),
         "-vn",
         "-c:a", "libmp3lame",
         "-b:a", "320k",
         "-map_metadata", "0",
-        "-id3v2_version", "3",
-        str(dst),
     ]
-    # On Windows, ffmpeg may emit non-cp1252 bytes; force UTF-8 and replace if needed
+    if title_for_tag:
+        cmd += ["-metadata", f"title={title_for_tag}"]
+    # Prefer ID3v2.3 for broad compatibility
+    cmd += ["-id3v2_version", "3", str(dst)]
+
     creationflags = 0
     if os.name == "nt":
-        # Prevents stray console windows when running from an IDE
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
     proc = subprocess.run(
@@ -170,12 +174,53 @@ def convert_to_mp3_320(ffmpeg: str, src: Path, dst: Path) -> int:
         print(f"[ffmpeg error] converting '{src}':\n{proc.stdout}")
     return proc.returncode
 
+def convert_to_aiff_pcm(ffmpeg: str, src: Path, dst: Path, title_for_tag: Optional[str]) -> int:
+    """
+    Convert src to uncompressed AIFF (PCM 16-bit big-endian) at dst.
+    Writes ID3v2.3 metadata so apps like Rekordbox can read Title.
+    Returns ffmpeg returncode (0 on success).
+    """
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        ffmpeg,
+        "-hide_banner", "-nostdin",
+        "-loglevel", "error",
+        "-y",
+        "-i", str(src),
+        "-vn",
+        "-c:a", "pcm_s16be",      # uncompressed AIFF
+        "-map_metadata", "0",     # copy source metadata (then we override title if provided)
+        "-write_id3v2", "1",      # ensure AIFF gets an ID3 chunk
+        "-id3v2_version", "3",    # v2.3 = widest compatibility
+    ]
+    if title_for_tag:
+        cmd += ["-metadata", f"title={title_for_tag}"]
+    cmd += [str(dst)]
+
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    proc = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=creationflags,
+    )
+    if proc.returncode != 0:
+        print(f"[ffmpeg error] converting '{src}':\n{proc.stdout}")
+    return proc.returncode
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Convert Rekordbox playlist tracks to MP3 320kbps.")
+    parser = argparse.ArgumentParser(description="Convert Rekordbox playlist tracks to AIFF (default) or MP3 320kbps.")
     parser.add_argument("--playlist", required=True, help="Rekordbox playlist name")
-    parser.add_argument("-n", "--max-songs", type=int, metavar="N",
-                        help="Only process the first N tracks (by TrackNo)")
+    parser.add_argument(
+        "--format",
+        choices=["aiff", "mp3"],
+        default="aiff",
+        help="Output audio format. 'aiff' (uncompressed) or 'mp3' (320kbps CBR). Default: aiff",
+    )
     args = parser.parse_args()
 
     ffmpeg = ensure_ffmpeg()
@@ -187,12 +232,10 @@ def main():
         print(e)
         return
 
-    if args.max_songs and args.max_songs > 0:
-        songs = songs[:args.max_songs]
-
     # Output directory in the same folder as this script
     script_dir = Path(__file__).resolve().parent
-    out_dir = script_dir / f"{args.playlist}_mp3_320"
+    fmt_suffix = "aiff" if args.format == "aiff" else "mp3_320"
+    out_dir = script_dir / f"{args.playlist}_{fmt_suffix}"
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"Output folder: {out_dir}")
 
@@ -210,20 +253,31 @@ def main():
             continue
 
         src = Path(src_path_str)
-        # Destination filename: <stem>_mp3_320.mp3
-        dst_name = f"{src.stem}_mp3_320.mp3"
-        dst = out_dir / dst_name
-        dst = unique_with_counter(dst)  # avoid collisions
+
+        # Destination filename and extension
+        if args.format == "aiff":
+            dst_name = f"{src.stem}_aiff.aiff"
+            transcoded_title = f"{title} (AIFF)"
+        else:
+            dst_name = f"{src.stem}_mp3_320.mp3"
+            transcoded_title = f"{title} (320 mp3)"
+
+        dst = unique_with_counter(out_dir / dst_name)
 
         print(f"[convert] Track #{song.TrackNo}: '{title}'")
         print(f"    src: {src}")
         print(f"    dst: {dst}")
 
-        rc = convert_to_mp3_320(ffmpeg, src, dst)
+        if args.format == "aiff":
+            rc = convert_to_aiff_pcm(ffmpeg, src, dst, transcoded_title)
+        else:
+            rc = convert_to_mp3_320(ffmpeg, src, dst, transcoded_title)
+
         if rc == 0:
             converted += 1
         else:
             failures += 1
+
 
     print("\n=== Summary ===")
     print(f"Converted: {converted}")
