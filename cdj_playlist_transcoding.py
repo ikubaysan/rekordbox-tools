@@ -463,6 +463,12 @@ def main():
     script_dir = Path(__file__).resolve().parent
     fmt_suffix = "aiff" if args.format == "aiff" else "mp3_320"
     out_dir = script_dir / f"{args.playlist}_{fmt_suffix}"
+
+    # --- Remove existing output folder if it exists ---
+    if out_dir.exists():
+        print(f"[info] Removing existing output folder: {out_dir}")
+        shutil.rmtree(out_dir)
+
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"Output folder: {out_dir}")
 
