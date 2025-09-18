@@ -1,17 +1,12 @@
 #!/usr/bin/env python
 # cdj_compare_playlists.py
 # ------------------------
-# Compare two Rekordbox playlists (Base vs Candidate) and print:
-#  • song counts for both
-#  • which tracks match in both
-#  • hot-cue counts for each matched track
-#  • if hot-cue COUNT matches, also compare hot-cue TIMESTAMPS with ±tol
-#  • which are missing or extra
-#  • TrackNo alignment suggestions
-# New:
-#  • --apply-hotcues: clone base HOT cues into candidate on mismatches
-#  • --only-differences: hide the per-track OK details, show just diffs
-#  • Clear, sectioned diff report with summaries
+# Compare two Rekordbox playlists (Base vs Candidate) and print diffs.
+# Options:
+#  • --apply-hotcues   : Clone base HOT cues to candidate when mismatched
+#  • --apply-order     : Reorder candidate TrackNo to match base
+#  • --force-order     : Proceed with reordering even if missing/extra tracks
+#  • --only-differences: Hide OK details; show only diffs
 
 import argparse, os, re, sys, unicodedata
 from dataclasses import dataclass
@@ -20,7 +15,7 @@ from typing import Optional, List, Tuple
 from collections import defaultdict
 
 from RekordboxPlaylistAnalyzer import RekordboxPlaylistAnalyzer
-from pyrekordbox.db6.tables import DjmdCue  # for cloning/creating cues
+from pyrekordbox.db6.tables import DjmdCue
 
 _SUFFIX_TITLE_RE = re.compile(r"\s*\((?:320\s*mp3|AIFF|Transcoded)\)\s*$", re.IGNORECASE)
 _NON_ALNUM_RE = re.compile(r"[^0-9a-z]+", re.IGNORECASE)
@@ -143,6 +138,7 @@ def _fmt_ms(ms: int) -> str:
 @dataclass
 class Rec:
     content_id: int
+    song_pl_id: str       # DjmdSongPlaylist.ID (needed for moving)
     artist_norm: str
     title_norm: str
     fb_norm: Optional[str]
@@ -162,6 +158,7 @@ def _mk_rec(song) -> Rec:
     hot_ms = _hot_cue_positions_ms(c)
     return Rec(
         content_id=int(getattr(c, "ID")),
+        song_pl_id=str(getattr(song, "ID")),            # <-- keep SongPlaylist row ID
         artist_norm=_norm(artist),
         title_norm=_norm(title),
         fb_norm=fb,
@@ -218,10 +215,9 @@ def _match(base:List[Rec],cand:List[Rec],title_fb=True) -> Tuple[List[Tuple[Rec,
     extra=[cand[i] for i in range(nc) if not used_c[i]]
     return matches,missing,extra
 
-# --- DB write helpers (clone-based) -----------------------------------------
+# --- DB write helpers (hot-cues) --------------------------------------------
 
 def _delete_existing_hot_cues(db, content_id: int) -> int:
-    """Delete all NON-memory cues for a given content. Returns the number deleted."""
     deleted = 0
     q = db.get_cue(ContentID=str(content_id))
     for cue in q.all():
@@ -233,13 +229,9 @@ def _delete_existing_hot_cues(db, content_id: int) -> int:
     return deleted
 
 def _clone_hot_cues_from_base_to_cand(db, base_content_id: int, cand_content_id: int) -> Tuple[int,int]:
-    """
-    Clone all HOT cues from base_content_id to cand_content_id.
-    Returns (deleted_count, created_count) for the candidate.
-    """
     deleted = _delete_existing_hot_cues(db, cand_content_id)
     created = 0
-    cue_columns = [col for col in DjmdCue.columns() if col not in ("ID", "ContentID")]  # real DB cols
+    cue_columns = [col for col in DjmdCue.columns() if col not in ("ID", "ContentID")]
     base_q = db.get_cue(ContentID=str(base_content_id))
     for base_cue in base_q.all():
         if getattr(base_cue, "is_memory_cue", False) is True:
@@ -264,8 +256,13 @@ def main():
     ap.add_argument("--candidate",required=True)
     ap.add_argument("--no-title-fallback",action="store_true")
     ap.add_argument("--hotcue-tolerance-ms", type=int, default=100)
+
     ap.add_argument("--apply-hotcues", action="store_true",
-                    help="Overwrite mismatched candidate hot cues to match base (Rekordbox must be CLOSED for commit).")
+                    help="Clone base HOT cues to candidate when mismatched (Rekordbox must be CLOSED for commit).")
+    ap.add_argument("--apply-order", action="store_true",
+                    help="Reorder candidate TrackNo to match base (Rekordbox must be CLOSED for commit).")
+    ap.add_argument("--force-order", action="store_true",
+                    help="Proceed with reordering even if there are missing/extra tracks (moves only matched ones).")
     ap.add_argument("--only-differences", action="store_true",
                     help="Show only differences (omit per-track OK details).")
     args=ap.parse_args()
@@ -311,7 +308,7 @@ def main():
                     print(f"       • Hot cues (placement): ❌ mismatch within ±{tol}ms")
             else:
                 if not args.only_differences:
-                    print(f"       • Hot cues (placement): ✅ all matched within ±{tol}ms)")
+                    print(f"       • Hot cues (placement): ✅ all matched within ±{tol}ms")
     if not args.only_differences:
         print()
 
@@ -363,9 +360,102 @@ def main():
             print(f"  - {b.label}: base #{b.track_no} | cand #{c.track_no}  → suggested: move candidate to #{b.track_no}")
         print()
 
-    # --- Optional write-back of hot cues ------------------------------------
+
+    # --- Optional: reorder candidate TrackNo to match base -------------------
+    if args.apply_order:
+        if (missing or extra) and not args.force_order:
+            print("⚠️  Not reordering because candidate differs in membership.")
+            print("    Use --force-order to move only the matched tracks anyway.\n")
+        cand_playlist = a.playlists.get(args.candidate)
+        if cand_playlist is None:
+            print(f"❌ Candidate playlist '{args.candidate}' not found."); sys.exit(2)
+
+        # Desired final order = candidate songs sorted by the BASE track numbers
+        desired = sorted(matches, key=lambda t: t[0].track_no)
+        desired_ids = [c.song_pl_id for (b, c) in desired]
+
+        # Current positions map from the playlist as-is (TrackNo order)
+        # 'cand' is already in TrackNo order from earlier
+        cand_ids_in_order = [r.song_pl_id for r in cand]
+        pos = {sid: i + 1 for i, sid in enumerate(cand_ids_in_order)}
+
+        # Plan-less stable resequencing: place #1, then #2, ... updating positions after each move
+        moves_made = []
+        for i, sid in enumerate(desired_ids, start=1):
+            curr = pos.get(sid)
+            if curr is None:
+                # Shouldn’t happen for matched tracks, but guard anyway
+                continue
+            if curr == i:
+                continue
+
+            # Print and perform the move
+            label = next((c.label for (b,c) in matches if c.song_pl_id == sid), sid)
+            print(f"  • {label}: cand #{curr} → #{i}")
+            try:
+                a.db.move_song_in_playlist(cand_playlist, sid, new_track_no=i)
+            except Exception as ex:
+                print(f"    ⚠️ Move failed for '{label}' (song_id={sid}): {ex}")
+                # Don’t try to “fake” the map if the DB move failed
+                continue
+
+            # Update our in-memory position map to reflect the ripple
+            if i > curr:
+                # Everything between (curr, i] shifts down by 1
+                for other_id, p in pos.items():
+                    if curr < p <= i:
+                        pos[other_id] = p - 1
+            else:
+                # Everything between [i, curr) shifts up by 1
+                for other_id, p in pos.items():
+                    if i <= p < curr:
+                        pos[other_id] = p + 1
+            pos[sid] = i
+            moves_made.append((label, curr, i))
+
+        if moves_made:
+            print("=== Applying Track Order (candidate ← base) ===")
+            for label, from_no, to_no in moves_made:
+                print(f"  • {label}: cand #{from_no} → #{to_no}")
+        else:
+            print("✅ No TrackNo moves needed; candidate order already matches base.")
+
+        # Commit the reordering
+        try:
+            a.db.commit(autoinc=True)
+            print("✅ Track order updated and committed.")
+        except RuntimeError as ex:
+            print("\n❌ Could not commit TrackNo changes.")
+            print(f"   Reason: {ex}")
+            print("   Hint: Close Rekordbox and rerun with --apply-order.")
+        except Exception as ex:
+            print("\n❌ Commit failed with unexpected error:")
+            print(f"   {ex}")
+
+        # --- Post-verify after reordering ---
+        print("\n=== Post-order verification ===")
+        cand_after = _playlist_entries(a, args.candidate)
+        matches_after, missing_after, extra_after = _match(base, cand_after, not args.no_title_fallback)
+        misaligned_after = [(b, c) for (b, c) in matches_after if b.track_no != c.track_no]
+        if not misaligned_after and not missing_after and not extra_after:
+            print("✅ Candidate order now matches base exactly.")
+        else:
+            if misaligned_after:
+                print(f"🔁 Still misaligned after move ({len(misaligned_after)}):")
+                for b, c in misaligned_after:
+                    print(f"  - {b.label}: base #{b.track_no} | cand #{c.track_no} → should be #{b.track_no}")
+            if missing_after:
+                print(f"❌ Missing in Candidate after order: {len(missing_after)}")
+            if extra_after:
+                print(f"➕ Additional in Candidate after order: {len(extra_after)}")
+        print()
+
+
+
+
+
+    # --- Optional: hot-cue write-back ---------------------------------------
     if args.apply_hotcues:
-        # Fix everything that’s wrong with hot cues (count OR placement)
         to_fix: List[Tuple[Rec, Rec, str]] = []
         for (b,c) in hotcue_count_mismatches:
             if b.hot_cues > 0:
@@ -400,8 +490,10 @@ def main():
                     print("\n❌ Commit failed with unexpected error:")
                     print(f"   {ex}")
             else:
-                print("\nNothing to commit (no changes were staged).")
+                print("\nNothing to commit (no hot-cue changes were staged).")
 
+    # ---- Exit status --------------------------------------------------------
+    any_diffs = (missing or extra or hotcue_count_mismatches or hotcue_placement_mismatches or misaligned)
     print()
     if not any_diffs:
         print("✅ All content matches")
