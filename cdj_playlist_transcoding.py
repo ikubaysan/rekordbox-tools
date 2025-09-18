@@ -30,6 +30,7 @@ from mutagen.id3 import ID3, APIC, TIT2, ID3NoHeaderError, PIC
 from mutagen.flac import FLAC
 from mutagen.mp4 import MP4, MP4Cover
 from mutagen.aiff import AIFF
+import time
 
 AUDIO_EXTS = {
     ".mp3", ".wav", ".aiff", ".aif", ".flac", ".m4a", ".alac", ".aac", ".ogg", ".wma"
@@ -361,6 +362,8 @@ def main():
             converted += 1
         else:
             failures += 1
+
+        time.sleep(2)
 
     print("\n=== Summary ===")
     print(f"Converted: {converted}")
