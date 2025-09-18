@@ -1,10 +1,12 @@
 #!/usr/bin/env python
-# cdj_compare_playlists.py
+# compare_playlists.py
 # --------------------
 # Compare two Rekordbox playlists (Base vs Candidate) and print:
 #  • song counts for both
 #  • which tracks match in both
 #  • which are missing or extra
+#  • if NO tracks are missing: check per-track TrackNo alignment and
+#    suggest the candidate TrackNo that should match the base
 #
 # Matching order:
 #  1) artist+title
@@ -14,7 +16,7 @@
 import argparse, os, re, sys, unicodedata
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Tuple
 from collections import defaultdict
 
 from RekordboxPlaylistAnalyzer import RekordboxPlaylistAnalyzer
@@ -46,7 +48,7 @@ def _normalize_urlish_path(p: str) -> str:
             v=v[1:]
     return os.path.normpath(v)
 
-def _guess_content_path(c) -> Optional[Path]:
+def _guess_content_path(c):
     for n in _POSSIBLE_PATH_FIELDS_ORDERED:
         if hasattr(c,n):
             v = getattr(c,n)
@@ -94,6 +96,7 @@ class Rec:
     title_norm: str
     fb_norm: Optional[str]
     label: str
+    track_no: int  # Track number in its respective playlist
 
 def _mk_rec(song) -> Rec:
     c = song.Content
@@ -102,7 +105,14 @@ def _mk_rec(song) -> Rec:
     fb = None
     p = _guess_content_path(c)
     if p: fb = _norm(_strip_file_suffixes(p.stem))
-    return Rec(_norm(artist),_norm(title),fb,f"{artist} — {title}" if artist else title)
+    label = f"{artist} — {title}" if artist else title
+    return Rec(
+        artist_norm=_norm(artist),
+        title_norm=_norm(title),
+        fb_norm=fb,
+        label=label,
+        track_no=int(getattr(song, "TrackNo", 0) or 0),
+    )
 
 def _playlist_entries(analyzer: RekordboxPlaylistAnalyzer,name:str)->List[Rec]:
     return [_mk_rec(s) for s in analyzer.get_playlist_songs_by_trackno(name)]
@@ -118,11 +128,12 @@ def _pop(buckets,k):
     arr=buckets.get(k)
     if arr: return arr.pop()
 
-def _match(base:List[Rec],cand:List[Rec],title_fb=True):
+def _match(base:List[Rec],cand:List[Rec],title_fb=True) -> Tuple[List[Tuple[Rec,Rec]], List[Rec], List[Rec]]:
     nb,nc=len(base),len(cand)
     used_b=[False]*nb
     used_c=[False]*nc
-    matches=[]
+    matches: List[Tuple[Rec,Rec]] = []
+
     def cand_idx(): return [i for i in range(nc) if not used_c[i]]
 
     # pass1: artist+title
@@ -180,13 +191,28 @@ def main():
         print(f"❌ Missing in Candidate ({len(missing)}):")
         for r in missing: print(f"  - {r.label}")
         print()
-
     if extra:
         print(f"➕ Additional in Candidate ({len(extra)}):")
         for r in extra: print(f"  + {r.label}")
         print()
 
-    if not missing and not extra: sys.exit(0)
+    # If nothing is missing, check track numbers alignment
+    if not missing:
+        misaligned = [(b, c) for (b,c) in matches if b.track_no != c.track_no]
+        if not misaligned:
+            print("🔢 Track numbers: all aligned with base.")
+        else:
+            print(f"🔢 Track numbers: {len(misaligned)} not aligned. Suggested candidate TrackNo → base TrackNo:")
+            for b, c in sorted(misaligned, key=lambda t: b.track_no):
+                # Candidate should adopt base.track_no to match
+                print(f"  • {b.label}\n"
+                      f"      candidate #{c.track_no} ⇒ should be #{b.track_no}")
+        print()
+
+    # exit code
+    if not missing and not extra:
+        # identical content, possibly with TrackNo differences (still exit 0)
+        sys.exit(0 if not [(b,c) for (b,c) in matches if b.track_no != c.track_no] else 1)
     sys.exit(1)
 
 if __name__=="__main__":
