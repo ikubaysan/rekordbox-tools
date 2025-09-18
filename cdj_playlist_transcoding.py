@@ -410,7 +410,7 @@ def convert_to_mp3_320(ffmpeg: str, src: Path, dst: Path, title_for_tag: Optiona
 
 def convert_to_aiff_pcm_24bit(ffmpeg: str, src: Path, dst: Path, title_for_tag: Optional[str]) -> int:
     """
-    Convert src to uncompressed AIFF at 24-bit PCM (pcm_s24be) at dst.
+    Convert src to uncompressed AIFF at 24-bit PCM (pcm_s24be) and 48 kHz at dst.
     We do NOT try to write ID3 in ffmpeg; mutagen will write a proper ID3 chunk.
     """
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -421,8 +421,9 @@ def convert_to_aiff_pcm_24bit(ffmpeg: str, src: Path, dst: Path, title_for_tag: 
         "-y",
         "-i", str(src),
         "-vn",
-        "-c:a", "pcm_s24be",     # always 24-bit big-endian
-        "-map_metadata", "0",    # harmless; AIFF ID3 will be handled by mutagen
+        "-c:a", "pcm_s24be",   # always 24-bit big-endian
+        "-ar", "48000",        # force 48 kHz sample rate
+        "-map_metadata", "0",  # harmless; AIFF ID3 will be handled by mutagen
     ]
     if title_for_tag:
         cmd += ["-metadata", f"title={title_for_tag}"]
@@ -436,6 +437,7 @@ def convert_to_aiff_pcm_24bit(ffmpeg: str, src: Path, dst: Path, title_for_tag: 
     if proc.returncode != 0:
         print(f"[ffmpeg error] converting '{src}':\n{proc.stdout}")
     return proc.returncode
+
 
 # ------------------ Main ------------------
 
