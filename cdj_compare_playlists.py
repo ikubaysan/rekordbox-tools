@@ -8,6 +8,8 @@
 #  • --force-order     : Proceed with reordering even if missing/extra tracks
 #  • --only-differences: Hide OK details; show only diffs
 
+# Example: python cdj_compare_playlists.py --base "Venture Eurobeat" --candidate "Venture Eurobeat USB" --apply-order --apply-hotcues
+
 import argparse, os, re, sys, unicodedata
 from dataclasses import dataclass
 from pathlib import Path
