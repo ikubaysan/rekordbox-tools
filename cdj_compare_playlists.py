@@ -498,7 +498,7 @@ def main():
     any_diffs = (missing or extra or hotcue_count_mismatches or hotcue_placement_mismatches or misaligned)
     print()
     if not any_diffs:
-        print("✅ All content matches")
+        print("✅ All content matches. Remember to fix gridlines.")
         sys.exit(0)
     else:
         print("❌ Content differs")
