@@ -192,7 +192,8 @@ class RekordboxPlaylistAnalyzer:
 
         total_duration_ms = 0
         total_adjusted_duration_ms = 0
-        skipped = 0
+        skipped_count = 0
+        valid_count = 0
         prev_bpm = None
 
         for song in all_songs:
@@ -201,7 +202,7 @@ class RekordboxPlaylistAnalyzer:
 
             if len(hot_cues) < 4:
                 output_lines.append(f"Skipping '{content.Title}': only {len(hot_cues)} hot cues.")
-                skipped += 1
+                skipped_count += 1
                 continue
 
             hot_cues.sort(key=lambda c: c.InMsec)
@@ -211,8 +212,10 @@ class RekordboxPlaylistAnalyzer:
             ]
             if len(distances) < 2:
                 output_lines.append(f"Skipping '{content.Title}': not enough distances.")
-                skipped += 1
+                skipped_count += 1
                 continue
+
+            valid_count += 1
 
             distances.sort(reverse=True)
             max_duration = distances[0] + distances[1]
@@ -253,7 +256,9 @@ class RekordboxPlaylistAnalyzer:
         output_lines.append(f"Original: {total_duration_ms} ms ({self.format_duration(total_duration_ms)})")
         output_lines.append(f"Adjusted (half BPM diff per song): {total_adjusted_duration_ms} ms "
                             f"({self.format_duration(total_adjusted_duration_ms)})")
-        output_lines.append(f"{len(output_lines) - 5} songs processed, {skipped} skipped.")
+        output_lines.append(f"{len(output_lines) - 5} songs processed, "
+                            f"{skipped_count} skipped, "
+                            f"{valid_count} valid.")
 
         return "\n".join(output_lines)
 

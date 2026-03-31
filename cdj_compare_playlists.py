@@ -96,16 +96,27 @@ def _hot_cue_positions_ms(c) -> List[int]:
     cues = getattr(c, "Cues", None)
     if not isinstance(cues, (list, tuple)):
         return []
-    out = []
+    out: List[int] = []
     for cue in cues:
         # Only HOT cues (exclude memory cues)
         if getattr(cue, "is_memory_cue", None) is True:
             continue
+
         ms = getattr(cue, "InMsec", None)
-        if isinstance(ms, int):
-            out.append(ms)
+        if ms is None:
+            continue
+
+        # Accept int/float/Decimal/numpy-int-like
+        try:
+            # round to nearest ms to avoid systematic truncation bias
+            out.append(int(round(float(ms))))
+        except Exception:
+            # if it's some non-numeric weirdness, skip
+            continue
+
     out.sort()
     return out
+
 
 def _match_hot_cue_positions(base_ms: List[int], cand_ms: List[int], tol_ms: int):
     used = [False] * len(cand_ms)
@@ -233,22 +244,82 @@ def _delete_existing_hot_cues(db, content_id: int) -> int:
 def _clone_hot_cues_from_base_to_cand(db, base_content_id: int, cand_content_id: int) -> Tuple[int,int]:
     deleted = _delete_existing_hot_cues(db, cand_content_id)
     created = 0
+
     cue_columns = [col for col in DjmdCue.columns() if col not in ("ID", "ContentID")]
     base_q = db.get_cue(ContentID=str(base_content_id))
+
     for base_cue in base_q.all():
         if getattr(base_cue, "is_memory_cue", False) is True:
             continue
+
         kwargs = {}
         for col in cue_columns:
+            v = None
+            ok = False
+
+            # Prefer attribute access (more reliable in many ORMs)
             try:
-                kwargs[col] = base_cue[col]
+                v = getattr(base_cue, col)
+                ok = True
             except Exception:
-                pass
+                ok = False
+
+            # Fallback: mapping-style access
+            if not ok:
+                try:
+                    v = base_cue[col]
+                    ok = True
+                except Exception:
+                    ok = False
+
+            if ok:
+                kwargs[col] = v
+
         new_id = db.generate_unused_id(DjmdCue, is_28_bit=True)
         new_cue = DjmdCue.create(ID=int(new_id), ContentID=str(cand_content_id), **kwargs)
         db.add(new_cue)
         created += 1
+
+    db.flush()
     return deleted, created
+
+
+
+def _pairwise_deltas(base_ms: List[int], cand_ms: List[int]) -> List[Tuple[int,int,int]]:
+    """
+    Pair by sorted order (index-to-index). Great for 'how many ms off' reporting.
+    Returns list of (base, cand, cand-base).
+    """
+    n = min(len(base_ms), len(cand_ms))
+    return [(base_ms[i], cand_ms[i], cand_ms[i] - base_ms[i]) for i in range(n)]
+
+def _summarize_deltas(deltas: List[Tuple[int,int,int]]) -> Tuple[int, float, int]:
+    if not deltas:
+        return (0, 0.0, 0)
+    absds = [abs(d) for (_,_,d) in deltas]
+    max_abs = max(absds)
+    avg_abs = sum(absds) / len(absds)
+    net = sum(d for (_,_,d) in deltas)  # sign matters (systematic offset)
+    return (max_abs, avg_abs, net)
+
+def _print_hotcue_delta_report(base_ms: List[int], cand_ms: List[int], indent: str = "      "):
+    deltas = _pairwise_deltas(base_ms, cand_ms)
+    max_abs, avg_abs, net = _summarize_deltas(deltas)
+
+    print(f"{indent}Δ hot cues (pairwise, sorted):")
+    if not deltas:
+        print(f"{indent}  (no pairwise deltas to show)")
+        return
+
+    for i, (b, c, d) in enumerate(deltas, start=1):
+        sign = "+" if d >= 0 else ""
+        print(f"{indent}  #{i}: base {_fmt_ms(b)}  →  cand {_fmt_ms(c)}   (Δ {sign}{d}ms)")
+
+    # summary line
+    sign_net = "+" if net >= 0 else ""
+    print(f"{indent}  Summary: max |Δ|={max_abs}ms, avg |Δ|={avg_abs:.1f}ms, net Δ={sign_net}{net}ms")
+
+
 
 # --- Main --------------------------------------------------------------------
 
@@ -304,6 +375,11 @@ def main():
                 print(f"       • Hot cues (placement): (skipped; counts differ)")
         else:
             pairs, unmatched_b, unmatched_c = _match_hot_cue_positions(b.hot_cue_ms, c.hot_cue_ms, tol_ms=tol)
+
+            # Always show the ms deltas if you want verbose output
+            if not args.only_differences:
+                _print_hotcue_delta_report(b.hot_cue_ms, c.hot_cue_ms)
+
             if unmatched_b or unmatched_c:
                 hotcue_placement_mismatches.append((b, c, unmatched_b, unmatched_c))
                 if not args.only_differences:
@@ -350,6 +426,7 @@ def main():
         print(f"📍 Hot-cue PLACEMENT mismatches within ±{tol}ms ({len(hotcue_placement_mismatches)}):")
         for b,c,ub,uc in hotcue_placement_mismatches:
             print(f"  - {b.label}")
+            _print_hotcue_delta_report(b.hot_cue_ms, c.hot_cue_ms, indent="      ")
             if ub:
                 print(f"      base unmatched: {', '.join(_fmt_ms(x) for x in ub)}")
             if uc:
@@ -494,11 +571,26 @@ def main():
             else:
                 print("\nNothing to commit (no hot-cue changes were staged).")
 
+        print("\n=== Post-hotcue verification ===")
+        cand_after = _playlist_entries(a, args.candidate)
+        matches_after, _, _ = _match(base, cand_after, not args.no_title_fallback)
+
+        # build lookup by candidate content id for quick access
+        cand_map = {c.content_id: c for (_, c) in matches_after}
+
+        for (b, c, reason) in to_fix:
+            c2 = cand_map.get(c.content_id)
+            if not c2:
+                print(f"- {b.label}: could not re-find candidate track after update")
+                continue
+            print(f"- {b.label}  [reason was: {reason}]")
+            _print_hotcue_delta_report(b.hot_cue_ms, c2.hot_cue_ms, indent="    ")
+
     # ---- Exit status --------------------------------------------------------
     any_diffs = (missing or extra or hotcue_count_mismatches or hotcue_placement_mismatches or misaligned)
     print()
     if not any_diffs:
-        print("✅ All content matches. Remember to fix gridlines.")
+        print("✅ All content matches. Remember to check gridlines.")
         sys.exit(0)
     else:
         print("❌ Content differs")
